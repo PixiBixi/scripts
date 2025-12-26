@@ -1,0 +1,17 @@
+bot_token: "bot_token"
+
+chat_ids:
+  - "chatId" # Person A
+  - "groupChatId" # Group A
+
+
+domain_a: "domain.tld"
+domain_b: "otherdomain.tld"
+
+check_interval: 300
+heartbeat_interval: 3600
+
+# Anti-spam
+fast_alert_interval: 900
+slow_alert_interval: 3600
+fast_alert_duration: 7200
