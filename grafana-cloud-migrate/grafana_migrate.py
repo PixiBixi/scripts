@@ -961,6 +961,19 @@ def load_state(path: Path) -> dict[str, dict[str, Any]]:
     return data if isinstance(data, dict) else {}
 
 
+def duplicate_of(twin: str | None, uid: str, exists_on_target: bool) -> str:
+    """Return the uid of the target dashboard this push would sit beside, if any.
+
+    Only a create can produce a twin. When the uid is already on the target the
+    push overwrites it in place, even if a homonym sits in the same folder: that
+    is a pair copied from the source, and skipping it would leave the dashboard
+    frozen at its previous version.
+    """
+    if exists_on_target or not twin or twin == uid:
+        return ""
+    return twin
+
+
 def is_unchanged(state: dict[str, dict[str, Any]], uid: str, version: Any) -> bool:
     """True when this dashboard is at the exact version the last apply pushed.
 
@@ -1161,7 +1174,7 @@ def plan(
             twin = target_index.get(
                 ((folder_title or "General").strip().lower(), (hit.get("title") or "").strip().lower())
             )
-            duplicate_uid = twin if (twin and twin != uid) else ""
+            duplicate_uid = duplicate_of(twin, uid, exists)
             if duplicate_uid:
                 duplicates.append(
                     {"folder": folder_title, "title": hit.get("title", ""),
@@ -1254,7 +1267,8 @@ def plan(
             f"DUPLICATE and apply will refuse them."
         )
         console.print(
-            f"Delete the target copies (they are earlier hand-made imports) and rerun plan, "
+            f"Delete the target copies (earlier hand-made imports, or leftovers pruned from "
+            f"the source) and rerun plan, "
             f"or pass --skip-duplicates. -> [cyan]{dup_path}[/cyan]"
         )
     if empty_dashboards:
