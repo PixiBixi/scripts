@@ -20,6 +20,7 @@ from grafana_migrate import (
     Resolver,
     annotation_key,
     build_datasource_map,
+    duplicate_of,
     index_by_folder_title,
     is_empty_after_drop,
     is_robot,
@@ -1137,3 +1138,28 @@ def test_manifest_survives_a_corrupt_rollback_file(tmp_path):
 
 def test_manifest_is_empty_without_any_file(tmp_path):
     assert load_manifest(tmp_path) == {}
+
+
+# --------------------------------------------------------------------------- #
+# Duplicate detection
+# --------------------------------------------------------------------------- #
+
+
+def test_a_create_next_to_a_homonym_is_a_duplicate():
+    assert duplicate_of("other-uid", "new-uid", exists_on_target=False) == "other-uid"
+
+
+def test_an_update_next_to_a_homonym_is_not_a_duplicate():
+    """A pair copied from the source: the push overwrites in place, no twin appears.
+
+    Flagging it made --skip-duplicates freeze both dashboards at their old version.
+    """
+    assert duplicate_of("other-uid", "tempo-reads", exists_on_target=True) == ""
+
+
+def test_no_homonym_means_no_duplicate():
+    assert duplicate_of(None, "u", exists_on_target=False) == ""
+
+
+def test_the_dashboard_itself_is_not_its_own_duplicate():
+    assert duplicate_of("u", "u", exists_on_target=False) == ""
