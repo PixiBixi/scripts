@@ -54,7 +54,7 @@ Passed by environment only, never as flags.
 | `SRC_TOKEN` | `GRAFANA_TOKEN`, `GRAFANA_SERVICE_ACCOUNT_TOKEN` | Source service account token |
 | `DST_URL` | none | Target instance, e.g. `https://<stack>.grafana.net`. Required |
 | `DST_TOKEN` | none | Target service account token. Asked for interactively when unset |
-| `GRAFANA_RPS` | | Client-side request ceiling per second, default `8`. `0` disables it |
+| `GRAFANA_RPS` | | Client-side request ceiling per second, default `10`. `0` disables it |
 
 The source falls back to the ambient `GRAFANA_*` variables, so a shell already
 configured against the old instance needs only `DST_URL` and `DST_TOKEN`. When a

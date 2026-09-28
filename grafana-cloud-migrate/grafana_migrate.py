@@ -54,7 +54,7 @@ SEARCH_PAGE_SIZE = 500
 # support can raise it, so the script self-throttles instead of assuming a number:
 # writes stay sequential, and 429 is retried with backoff honouring Retry-After.
 MAX_RETRIES = 6
-DEFAULT_RPS = 8.0
+DEFAULT_RPS = 10.0
 
 # Built-in datasources exist on every instance under a fixed uid: never remap them.
 BUILTIN_DS = frozenset(
