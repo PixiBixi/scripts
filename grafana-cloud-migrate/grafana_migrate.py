@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import unquote
 
 import requests
 import typer
@@ -73,6 +74,11 @@ BUILTIN_DS = frozenset(
 
 # "$ds", "${ds}", "${ds:raw}" -- a reference to a template variable, not to a real uid.
 VAR_RE = re.compile(r"^\$\{?[\w-]+(?::[\w-]+)?\}?$")
+
+# Short links are rows in the old instance's database: no host swap revives them.
+GOTO_RE = re.compile(r"/goto/[\w-]+")
+# A template variable pinned in a link, e.g. "&var-datasource=4d9f3e30df7b".
+VAR_PARAM_RE = re.compile(r"(?P<key>[?&]var-[\w.-]+=)(?P<value>[^&#\s\"'<>()\[\]]+)")
 
 
 class Method(StrEnum):
@@ -430,6 +436,9 @@ class RewriteStats:
     dropped: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     blocking_uids: set[str] = field(default_factory=set)
+    relinked: int = 0
+    relinked_ds: int = 0
+    goto_links: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -566,8 +575,76 @@ def _rewrite_template_vars(
         current["text"] = ""
 
 
+def _remap_var_param(match: re.Match[str], resolver: Resolver, stats: RewriteStats) -> str:
+    """Repoint one ``var-<name>=<value>`` link parameter whose value is a source datasource uid.
+
+    Only uids are looked up, never names: a value such as ``prod`` or ``All`` can
+    collide with a datasource name and must not be rewritten.
+    """
+    raw = match.group("value")
+    row = resolver.by_uid.get(unquote(raw))
+    if row is None or not row.resolved or row.dst_uid == raw:
+        return match.group(0)
+    stats.relinked_ds += 1
+    return f"{match.group('key')}{row.dst_uid}"
+
+
+def relink_text(
+    value: str, src_host: str, dst_host: str, resolver: Resolver, stats: RewriteStats, path: str
+) -> str:
+    """Repoint a string's links from the source instance to the target.
+
+    Dashboard uids are preserved, so ``/d/<uid>/...`` only needs the host swapped.
+    A datasource uid pinned in such a link (``var-datasource=<uid>``) is
+    instance-local and is remapped like any other reference. ``/goto/`` short links
+    cannot be fixed and are reported instead.
+
+    Args:
+        value: Any string of the dashboard: link URL, text panel, description.
+        src_host: Hostname of the source instance.
+        dst_host: Hostname of the target instance.
+        resolver: Datasource correspondence table.
+        stats: Collects what was changed and the short links left behind.
+        path: JSON path of the string, for the report.
+
+    Returns:
+        The string with every source link repointed.
+    """
+    if not src_host or src_host not in value:
+        return value
+    url_re = re.compile(rf"https?://{re.escape(src_host)}[^\s\"'<>()\[\]]*")
+
+    def relink_url(match: re.Match[str]) -> str:
+        url = match.group(0)
+        if GOTO_RE.search(url):
+            stats.goto_links.append(f"{path}: {url}")
+        return VAR_PARAM_RE.sub(lambda p: _remap_var_param(p, resolver, stats), url)
+
+    stats.relinked += value.count(src_host)
+    return url_re.sub(relink_url, value).replace(src_host, dst_host)
+
+
+def relink_tree(
+    node: Any, src_host: str, dst_host: str, resolver: Resolver, stats: RewriteStats, path: str = ""
+) -> Any:
+    """Recursively copy a JSON tree, repointing every string's source links."""
+    if isinstance(node, dict):
+        return {
+            key: relink_tree(value, src_host, dst_host, resolver, stats, f"{path}.{key}" if path else key)
+            for key, value in node.items()
+        }
+    if isinstance(node, list):
+        return [
+            relink_tree(v, src_host, dst_host, resolver, stats, f"{path}[{i}]")
+            for i, v in enumerate(node)
+        ]
+    if isinstance(node, str):
+        return relink_text(node, src_host, dst_host, resolver, stats, path)
+    return node
+
+
 def rewrite_dashboard(
-    dashboard: dict[str, Any], resolver: Resolver
+    dashboard: dict[str, Any], resolver: Resolver, src_host: str = "", dst_host: str = ""
 ) -> tuple[dict[str, Any], RewriteStats]:
     """Return a target-ready copy of a dashboard plus a report on the rewrite.
 
@@ -577,6 +654,8 @@ def rewrite_dashboard(
     Args:
         dashboard: The ``dashboard`` object as returned by the source API.
         resolver: Datasource correspondence table.
+        src_host: Hostname of the source instance. Empty skips the link rewrite.
+        dst_host: Hostname of the target instance.
 
     Returns:
         The rewritten dashboard and the statistics collected while rewriting.
@@ -584,6 +663,7 @@ def rewrite_dashboard(
     stats = RewriteStats()
     out = _walk(dashboard, resolver, stats, "")
     _rewrite_template_vars(out, resolver, stats)
+    out = relink_tree(out, src_host, dst_host, resolver, stats)
     out["id"] = None
     out.pop("version", None)
     return out, stats
@@ -1156,7 +1236,7 @@ def plan(
                 progress.advance(task)
                 continue
 
-            dashboard, stats = rewrite_dashboard(envelope["dashboard"], resolver)
+            dashboard, stats = rewrite_dashboard(envelope["dashboard"], resolver, src.host, dst.host)
             if stats.dangling:
                 dangling_dashboards += 1
             if is_empty_after_drop(stats):
@@ -1216,6 +1296,9 @@ def plan(
                     "dangling": " | ".join(stats.dangling),
                     "dropped": " | ".join(stats.dropped),
                     "duplicate_uid": duplicate_uid,
+                    "relinked": stats.relinked,
+                    "relinked_ds": stats.relinked_ds,
+                    "goto_links": " | ".join(stats.goto_links),
                     "src_version": src_version,
                     "src_updated": meta.get("updated", ""),
                     "warnings": " | ".join(stats.warnings),
@@ -1229,6 +1312,7 @@ def plan(
         "uid", "title", "folder", "action", "reason",
         "rewritten", "already_correct", "template_refs", "builtin_refs", "inherited_default",
         "unresolved", "dangling", "dropped", "duplicate_uid",
+        "relinked", "relinked_ds", "goto_links",
         "src_version", "src_updated", "warnings", "payload",
     ]
     with report_path.open("w", newline="", encoding="utf-8") as fh:
@@ -1443,6 +1527,164 @@ def apply(
         raise typer.Exit(1)
 
 
+def stored_schema(client: GrafanaClient, namespace: str, uid: str) -> str:
+    """Return the schema version a dashboard is stored in (``v0alpha1``, ``v2``...).
+
+    ``/api/dashboards`` serves every dashboard as v1, converting v2 ones on the fly,
+    and saving through it would store them back as v1.
+
+    Raises:
+        GrafanaError: When the namespace is wrong or the API is unavailable.
+    """
+    body = client.get(f"/apis/dashboard.grafana.app/v1beta1/namespaces/{namespace}/dashboards/{uid}")
+    return str(((body or {}).get("status") or {}).get("conversion", {}).get("storedVersion") or "")
+
+
+@app.command()
+def relink(
+    out: OutDir = DEFAULT_OUT,
+    src_host: Annotated[
+        str,
+        typer.Option("--src-host", help="Hostname of the old instance. Defaults to the host of $SRC_URL."),
+    ] = "",
+    namespace: Annotated[
+        str,
+        typer.Option(
+            "--namespace", envvar="DST_NAMESPACE",
+            help="Target API namespace: `default` on-prem, `stacks-<stack id>` on Grafana Cloud.",
+        ),
+    ] = "default",
+    folder: FolderOpt = None,
+    limit: LimitOpt = 0,
+    apply_changes: Annotated[
+        bool, typer.Option("--apply", help="Save the relinked dashboards. Without it this only reports.")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not ask for confirmation.")] = False,
+) -> None:
+    """Repoint links to the old instance in dashboards already on the target.
+
+    Works on the target copy, so edits made there since the migration are kept.
+    Only reads the source hostname, never the source API.
+    """
+    if not src_host:
+        hit = resolve_env(SRC_URL_VARS)
+        src_host = hit[1].split("://", 1)[-1].split("/", 1)[0] if hit else ""
+    if not src_host:
+        console.print("[red]Pass --src-host or set SRC_URL.[/red]")
+        raise typer.Exit(2)
+    map_path = out / "datasource_map.csv"
+    if not map_path.exists():
+        console.print(f"[red]No datasource map at {map_path}.[/red] Run `preflight` first.")
+        raise typer.Exit(2)
+    resolver = Resolver(read_map_csv(map_path))
+    dst_url, dst_token = resolve_target()
+    dst = GrafanaClient(dst_url, dst_token, "target", float(os.environ.get("GRAFANA_RPS", DEFAULT_RPS)))
+
+    hits = [
+        h for h in dst.search("dash-db")
+        if not folder or (h.get("folderTitle") or "General") in folder
+    ]
+    hits = hits[:limit] if limit else hits
+    console.print(f"{len(hits)} target dashboards, repointing {src_host} -> {dst.host}")
+
+    payload_dir = out / "relink"
+    payload_dir.mkdir(parents=True, exist_ok=True)
+    report: list[dict[str, Any]] = []
+    with Progress(
+        SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("scanning", total=len(hits))
+        for hit in hits:
+            uid = hit["uid"]
+            progress.update(task, description=f"scanning {hit.get('title', uid)[:48]}")
+            progress.advance(task)
+            envelope = dst.get_dashboard(uid)
+            if envelope is None:
+                continue
+            stats = RewriteStats()
+            dashboard = relink_tree(envelope["dashboard"], src_host, dst.host, resolver, stats)
+            if not stats.relinked:
+                continue
+            meta = envelope.get("meta", {})
+            row: dict[str, Any] = {
+                "uid": uid,
+                "title": hit.get("title", ""),
+                "folder": hit.get("folderTitle") or "General",
+                "action": "relink",
+                "relinked": stats.relinked,
+                "relinked_ds": stats.relinked_ds,
+                "goto_links": " | ".join(stats.goto_links),
+            }
+            if meta.get("provisioned"):
+                row.update(action="skip", reason="provisioned: fix it in its own repository")
+            else:
+                try:
+                    schema = stored_schema(dst, namespace, uid)
+                except GrafanaError as exc:
+                    console.print(f"[red]Cannot read the stored schema of {uid}:[/red] {exc}")
+                    console.print("On Grafana Cloud pass --namespace stacks-<stack id>.")
+                    raise typer.Exit(2) from exc
+                if schema.startswith("v2"):
+                    row.update(
+                        action="skip",
+                        reason=f"stored as {schema}: /api/dashboards would save it as v1, fix it by hand",
+                    )
+            if row["action"] == "relink":
+                # Target version kept: a save made meanwhile fails with 412 instead of being lost.
+                target = payload_dir / f"{uid}.json"
+                target.write_text(
+                    json.dumps(
+                        {
+                            "dashboard": dashboard,
+                            "folderUid": meta.get("folderUid", ""),
+                            "overwrite": False,
+                            "message": f"relink: {src_host} -> {dst.host}",
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                row["payload"] = str(target)
+            report.append(row)
+
+    report_path = out / "relink.csv"
+    fields = [
+        "uid", "title", "folder", "action", "reason", "relinked", "relinked_ds", "goto_links", "payload",
+    ]
+    with report_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(report)
+
+    todo = [r for r in report if r["action"] == "relink"]
+    gotos = sum(len(r["goto_links"].split(" | ")) for r in report if r["goto_links"])
+    console.print(
+        f"{len(report)} dashboards link to {src_host}: {len(todo)} to relink, "
+        f"{len(report) - len(todo)} skipped, "
+        f"{sum(r['relinked'] for r in report)} links, {sum(r['relinked_ds'] for r in report)} datasource uids"
+    )
+    if gotos:
+        console.print(f"[yellow]{gotos} /goto/ short links cannot be repointed[/yellow]: recreate them.")
+    console.print(f"report -> [cyan]{report_path}[/cyan]")
+    if not apply_changes or not todo:
+        return
+    if not yes and not typer.confirm(f"Save {len(todo)} dashboards on {dst.base_url}?"):
+        raise typer.Exit(1)
+
+    failures: list[tuple[str, str]] = []
+    for row in todo:
+        try:
+            dst.post("/api/dashboards/db", json.loads(Path(row["payload"]).read_text(encoding="utf-8")))
+        except GrafanaError as exc:
+            failures.append((row["uid"], str(exc)))
+    console.print(f"[green]{len(todo) - len(failures)} dashboards relinked[/green]")
+    if failures:
+        console.print(f"[red]{len(failures)} failures[/red] (412 means saved meanwhile: rerun):")
+        for uid, err in failures[:20]:
+            console.print(f"  {uid}: {err}")
+        raise typer.Exit(1)
 
 
 # --------------------------------------------------------------------------- #

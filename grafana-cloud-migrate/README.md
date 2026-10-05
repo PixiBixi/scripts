@@ -82,6 +82,7 @@ The tokens need `dashboards:read` + `datasources:read` on the source, and
 | `preflight` | no | Checks both instances, builds `out/datasource_map.csv` |
 | `plan` | no | Builds every target payload under `out/dashboards/`, writes `out/plan.csv`, `out/blockers.csv` and `out/empty_after_drop.csv` |
 | `apply` | yes | Creates folders, pushes dashboards, writes `out/rollback.json` |
+| `relink` | with `--apply` | Repoints links to the old instance in dashboards already on the target, writes `out/relink.csv` |
 | `prune` | with `--apply` | Deletes target dashboards this tool pushed that have gone from the source |
 | `library-panels` | with `--apply` | Copies the library panels, keeping their uid. Reports only without `--apply` |
 | `annotations` | with `--apply` | Copies hand-written dashboard annotations, skipping CI markers |
@@ -99,13 +100,15 @@ The tokens need `dashboards:read` + `datasources:read` on the source, and
 | --- | --- | --- | --- |
 | `--out` | all | `out` | Directory for reports and payloads |
 | `--rebuild` | `preflight` | off | Discard an existing datasource map and rebuild it |
-| `--folder` | `plan`, `apply` | all | Restrict to this folder title. Repeatable |
+| `--folder` | `plan`, `apply`, `relink` | all | Restrict to this folder title. Repeatable |
 | `--exclude` | `plan`, `apply` | none | Regex on folder or dashboard title. Repeatable |
 | `--include-backups` | `plan`, `apply` | off | Do not skip the `Backups` folder |
 | `--skip-empty` | `plan` | off | Skip dashboards whose every datasource was dropped |
 | `--skip-duplicates` | `apply` | off | Leave dashboards already on the target under another uid alone |
 | `--force` | `plan`, `alerts-plan` | off | Replan everything, ignoring what the last apply pushed |
-| `--limit` | `plan`, `apply` | `0` | Stop after N dashboards. `0` means no limit |
+| `--limit` | `plan`, `apply`, `relink` | `0` | Stop after N dashboards. `0` means no limit |
+| `--src-host` | `relink` | host of `$SRC_URL` | Hostname of the old instance |
+| `--namespace` | `relink` | `default`, or `$DST_NAMESPACE` | Target API namespace, `stacks-<stack id>` on Grafana Cloud |
 | `--skip-blocked` | `apply` | off | Skip blocked dashboards instead of aborting |
 | `--yes` / `-y` | `apply`, `rollback` | off | Do not ask for confirmation |
 
@@ -160,6 +163,9 @@ edit: keep a copy if the decisions took work.
 | `dangling` | Datasource absent from the source too: already broken, migrated as-is |
 | `dropped` | Datasource marked `DROP` in the map: abandoned on purpose, migrated as-is |
 | `duplicate_uid` | Uid of a dashboard already on the target with the same folder and title |
+| `relinked` | Occurrences of the source hostname repointed to the target (links, text panels, descriptions) |
+| `relinked_ds` | Source datasource uids pinned in those links (`var-<name>=<uid>`) remapped to the target uid |
+| `goto_links` | `/goto/` short links to the source: instance-local, recreate them by hand |
 | `warnings` | Library panels and legacy panel alerts, which this script does not migrate |
 
 ### Reruns only push what changed
@@ -193,6 +199,23 @@ are not collisions and are not reported.
 `BLOCKED` rows make `apply` abort unless `--skip-blocked` is passed. Fix them in
 the datasource map rather than skipping them: an unmapped datasource renders as an
 empty panel, which is easy to miss.
+
+## Links to the old instance
+
+`plan` repoints every `https://<source host>/...` string of a dashboard to the target host, and remaps a source datasource uid pinned in such a link. For dashboards migrated before this existed, `relink` does the same on the target copy, so edits made on the target since are kept:
+
+```bash
+export DST_NAMESPACE=stacks-123456
+./grafana_migrate.py relink --src-host grafana.example.com            # read out/relink.csv
+./grafana_migrate.py relink --src-host grafana.example.com --apply
+```
+
+| `relink.csv` action | Meaning |
+| --- | --- |
+| `relink` | Saved with `--apply`, version note `relink: <source> -> <target>` |
+| `skip` | Provisioned, or stored as schema v2: `/api/dashboards` would save it back as v1. Fix by hand |
+
+A dashboard saved between the scan and the write fails with `412`: rerun.
 
 ## Rate limiting
 
