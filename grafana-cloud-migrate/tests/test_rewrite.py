@@ -18,6 +18,7 @@ from grafana_migrate import (
     MapRow,
     Method,
     Resolver,
+    RewriteStats,
     annotation_key,
     build_datasource_map,
     duplicate_of,
@@ -34,6 +35,7 @@ from grafana_migrate import (
     read_map_csv,
     receiver_of,
     receivers_in_tree,
+    relink_text,
     resolve_env,
     resolve_target,
     rewrite_alert_rule,
@@ -1163,3 +1165,68 @@ def test_no_homonym_means_no_duplicate():
 
 def test_the_dashboard_itself_is_not_its_own_duplicate():
     assert duplicate_of("u", "u", exists_on_target=False) == ""
+
+
+# --------------------------------------------------------------------------- #
+# Links to the old instance inside dashboards
+# --------------------------------------------------------------------------- #
+
+OLD, NEW = "grafana.example.com", "example.grafana.net"
+
+
+def test_dashboard_links_and_text_are_repointed(resolver):
+    dash = {
+        "uid": "d1",
+        "links": [{"url": f"https://{OLD}/d/abc/net?orgId=1&var-dc=$dc"}],
+        "panels": [
+            {"type": "text", "options": {"content": f"See [ops](https://{OLD}/d/ops) or {OLD}"}},
+        ],
+    }
+    out, stats = rewrite_dashboard(dash, resolver, OLD, NEW)
+    assert out["links"][0]["url"] == f"https://{NEW}/d/abc/net?orgId=1&var-dc=$dc"
+    assert out["panels"][0]["options"]["content"] == f"See [ops](https://{NEW}/d/ops) or {NEW}"
+    assert stats.relinked == 3
+
+
+def test_datasource_uid_pinned_in_a_link_is_remapped(resolver):
+    """A pinned var-datasource carries a source-only uid."""
+    stats = RewriteStats()
+    url = f"https://{OLD}/d/x/y?var-datasource=src-prom&var-region=${{region}}&var-env=src-orphan"
+    out = relink_text(url, OLD, NEW, resolver, stats, "links[0].url")
+    assert out == f"https://{NEW}/d/x/y?var-datasource=dst-prom&var-region=${{region}}&var-env=src-orphan"
+    assert stats.relinked_ds == 1, "unresolved uids are left as they are"
+
+
+def test_link_params_are_never_matched_by_datasource_name(resolver):
+    stats = RewriteStats()
+    url = f"https://{OLD}/d/x/y?var-ds=Thanos"
+    assert relink_text(url, OLD, NEW, resolver, stats, "p") == f"https://{NEW}/d/x/y?var-ds=Thanos"
+    assert stats.relinked_ds == 0
+
+
+def test_goto_short_links_are_reported(resolver):
+    stats = RewriteStats()
+    relink_text(f"https://{OLD}/goto/aBc12?orgId=1", OLD, NEW, resolver, stats, "links[0].url")
+    assert stats.goto_links == [f"links[0].url: https://{OLD}/goto/aBc12?orgId=1"]
+
+
+def test_links_already_on_the_target_are_left_alone(resolver):
+    stats = RewriteStats()
+    url = f"https://{NEW}/d/x/y?var-datasource=src-prom"
+    assert relink_text(url, OLD, NEW, resolver, stats, "p") == url
+    assert stats.relinked == 0
+
+
+def test_no_source_host_means_no_relink(resolver):
+    dash = {"uid": "d1", "links": [{"url": f"https://{OLD}/d/abc"}]}
+    out, stats = rewrite_dashboard(dash, resolver)
+    assert out["links"][0]["url"] == f"https://{OLD}/d/abc"
+    assert stats.relinked == 0
+
+
+def test_only_the_whole_source_hostname_is_repointed(resolver):
+    stats = RewriteStats()
+    text = f"https://{OLD}.evil.net/d/x https://my{OLD}/d/y https://{OLD}:443/d/z"
+    out = relink_text(text, OLD, NEW, resolver, stats, "p")
+    assert out == f"https://{OLD}.evil.net/d/x https://my{OLD}/d/y https://{NEW}:443/d/z"
+    assert stats.relinked == 1
