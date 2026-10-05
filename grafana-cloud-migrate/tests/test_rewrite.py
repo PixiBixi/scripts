@@ -1222,3 +1222,11 @@ def test_no_source_host_means_no_relink(resolver):
     out, stats = rewrite_dashboard(dash, resolver)
     assert out["links"][0]["url"] == f"https://{OLD}/d/abc"
     assert stats.relinked == 0
+
+
+def test_only_the_whole_source_hostname_is_repointed(resolver):
+    stats = RewriteStats()
+    text = f"https://{OLD}.evil.net/d/x https://my{OLD}/d/y https://{OLD}:443/d/z"
+    out = relink_text(text, OLD, NEW, resolver, stats, "p")
+    assert out == f"https://{OLD}.evil.net/d/x https://my{OLD}/d/y https://{NEW}:443/d/z"
+    assert stats.relinked == 1

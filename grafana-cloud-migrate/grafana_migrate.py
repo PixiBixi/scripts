@@ -612,7 +612,9 @@ def relink_text(
     """
     if not src_host or src_host not in value:
         return value
-    url_re = re.compile(rf"https?://{re.escape(src_host)}[^\s\"'<>()\[\]]*")
+    # Whole hostname only: "grafana.example.com.evil.net" or "mygrafana.example.com" stay as they are.
+    host = rf"(?<![\w.-]){re.escape(src_host)}(?![\w-]|\.[\w-])"
+    url_re = re.compile(rf"https?://{host}[^\s\"'<>()\[\]]*")
 
     def relink_url(match: re.Match[str]) -> str:
         url = match.group(0)
@@ -620,8 +622,10 @@ def relink_text(
             stats.goto_links.append(f"{path}: {url}")
         return VAR_PARAM_RE.sub(lambda p: _remap_var_param(p, resolver, stats), url)
 
-    stats.relinked += value.count(src_host)
-    return url_re.sub(relink_url, value).replace(src_host, dst_host)
+    relinked = url_re.sub(relink_url, value)
+    relinked, count = re.subn(host, dst_host, relinked)
+    stats.relinked += count
+    return relinked
 
 
 def relink_tree(
@@ -1625,7 +1629,9 @@ def relink(
                     console.print(f"[red]Cannot read the stored schema of {uid}:[/red] {exc}")
                     console.print("On Grafana Cloud pass --namespace stacks-<stack id>.")
                     raise typer.Exit(2) from exc
-                if schema.startswith("v2"):
+                if not schema:
+                    row.update(action="skip", reason="stored schema unknown: not saved, check it by hand")
+                elif schema.startswith("v2"):
                     row.update(
                         action="skip",
                         reason=f"stored as {schema}: /api/dashboards would save it as v1, fix it by hand",
